@@ -5,13 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Сканер маркировки</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/zxing-wasm@2.2.4/dist/iife/reader/index.js"></script>
   <style>
     * { box-sizing: border-box; }
     body { font-family: sans-serif; background: #0f172a; color: #fff; margin: 0; display: flex; flex-direction: column; height: 100vh; }
     .header { padding: 16px; text-align: center; background: #1e293b; border-bottom: 1px solid #334155; }
     .header h3 { margin: 0 0 14px; }
     .scan-btn { background: #10b981; color: #fff; border: none; padding: 18px 24px; font-size: 18px; border-radius: 12px; width: 90%; font-weight: bold; }
-    .scan-btn:active { opacity: .8; }
+    .scan-btn:disabled { opacity: .5; }
     #status { margin-top: 10px; font-size: 12px; opacity: .8; min-height: 16px; }
     .scan-panel { flex: 1; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
     .scan-item { background: #1e293b; padding: 12px; border-radius: 8px; border-left: 4px solid #10b981; font-size: 14px; }
@@ -21,21 +22,50 @@
     .code { font-size: 11px; opacity: .7; word-break: break-all; }
     .msg { font-weight: bold; margin: 4px 0; }
     .det { font-size: 12px; opacity: .9; }
+
+    /* Окно камеры */
+    #cam { position: fixed; inset: 0; background: #000; display: none; z-index: 10; }
+    #cam.open { display: block; }
+    #video { width: 100%; height: 100%; object-fit: cover; }
+    .frame { position: absolute; top: 50%; left: 50%; width: 65vmin; height: 65vmin; transform: translate(-50%, -50%);
+             border: 3px solid rgba(255,255,255,.9); border-radius: 16px; box-shadow: 0 0 0 9999px rgba(0,0,0,.45); }
+    .frame.hit { border-color: #10b981; }
+    .cam-top { position: absolute; top: 0; left: 0; right: 0; padding: 16px; text-align: center; font-size: 15px; }
+    .cam-bottom { position: absolute; bottom: 0; left: 0; right: 0; padding: 16px; display: flex; gap: 10px; flex-direction: column; align-items: center; }
+    #camResult { min-height: 44px; width: 92%; padding: 10px; border-radius: 10px; background: rgba(15,23,42,.85); font-size: 14px; text-align: center; }
+    .cam-btns { display: flex; gap: 10px; width: 92%; }
+    .cam-btns button { flex: 1; padding: 14px; border: none; border-radius: 12px; font-size: 16px; font-weight: bold; color: #fff; }
+    #torchBtn { background: #334155; }
+    #closeBtn { background: #ef4444; }
   </style>
 </head>
 <body>
 
   <div class="header">
     <h3>Сканер маркировки</h3>
-    <button class="scan-btn" id="scanBtn">⚡️ Сканировать</button>
+    <button class="scan-btn" id="scanBtn">📷 Сканировать</button>
     <div id="status"></div>
   </div>
 
   <div class="scan-panel" id="itemsList"></div>
 
+  <div id="cam">
+    <video id="video" playsinline muted></video>
+    <div class="frame" id="frame"></div>
+    <div class="cam-top">Наведите Data Matrix в рамку</div>
+    <div class="cam-bottom">
+      <div id="camResult">Ищу код…</div>
+      <div class="cam-btns">
+        <button id="torchBtn">🔦 Фонарик</button>
+        <button id="closeBtn">✕ Готово</button>
+      </div>
+    </div>
+  </div>
+  <canvas id="canvas" hidden></canvas>
+
 <script>
   // ===== НАСТРОЙКИ =====
-  const API_URL = "https://script.google.com/macros/s/AKfycbw_4A1fnSB62hTXU3D5hj8CgnRHbxsapwCY66RZl-5P4Kl2FDVyWIZVCPvaOh2sE6lO/exec";   // URL развёртывания GAS
+  const API_URL = "https://script.google.com/macros/s/AKfycbzEBqoNOTWFHZ1-K09r3zhEUOCypqlvK4rdZtWAXiNkbj9hQ0y0QVc3XQZd6sYnx8k4/exec";
   const SERIAL_LEN = 13;
 
   const tg = window.Telegram.WebApp;
@@ -45,32 +75,113 @@
   const u = tg.initDataUnsafe?.user;
   const agentName = u ? [u.first_name, u.last_name].filter(Boolean).join(' ') : "Тестовый Агент";
 
-  const statusEl = document.getElementById('status');
-  const itemsList = document.getElementById('itemsList');
+  const $ = id => document.getElementById(id);
+  const statusEl = $('status'), itemsList = $('itemsList');
+  const camEl = $('cam'), video = $('video'), frameEl = $('frame'), camResult = $('camResult');
+  const canvas = $('canvas'), ctx = canvas.getContext('2d', { willReadFrequently: true });
+
   const scannedKeys = new Set();
   const items = [];
   let nextId = 1;
+  let stream = null, scanning = false, busy = false, torchOn = false;
+  let lastRaw = "", lastRawTime = 0;
 
-  statusEl.textContent = tg.platform + " · v" + tg.version + " · " + agentName;
-  window.addEventListener('error', e => setStatus("JS ошибка: " + e.message));
-  document.getElementById('scanBtn').addEventListener('click', startTgScanner);
+  setStatus(tg.platform + " · v" + tg.version + " · " + agentName);
+
+  // «Script error.» приходит из чужих скриптов (Telegram), не показываем
+  window.addEventListener('error', e => {
+    if (e.message && e.message !== 'Script error.') setStatus("JS ошибка: " + e.message);
+  });
+
+  // Заранее загружаем модуль распознавания
+  try { ZXingWASM.prepareZXingModule({ fireImmediately: true }); } catch (e) {}
+
+  $('scanBtn').addEventListener('click', openCamera);
+  $('closeBtn').addEventListener('click', closeCamera);
+  $('torchBtn').addEventListener('click', toggleTorch);
 
   function setStatus(t) { statusEl.textContent = t; }
 
-  // ===== Камера Telegram =====
-  function startTgScanner() {
+  // ===== Камера =====
+  async function openCamera() {
     try {
-      if (!tg.isVersionAtLeast('6.4') || typeof tg.showScanQrPopup !== 'function') {
-        setStatus("⚠️ Сканер не поддерживается (" + tg.platform + ", v" + tg.version + ")");
-        return;
-      }
-      tg.showScanQrPopup({ text: "Наведите на DataMatrix код" }, function (rawText) {
-        handleCode(rawText);
-        return true;
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1920 }, height: { ideal: 1080 },
+          focusMode: "continuous"
+        },
+        audio: false
       });
+      video.srcObject = stream;
+      await video.play();
+      camEl.classList.add('open');
+      camResult.textContent = "Ищу код…";
+      scanning = true;
+      scanLoop();
     } catch (e) {
-      setStatus("❌ " + e.message);
+      setStatus("❌ Нет доступа к камере: " + e.message + ". Разрешите камеру для Telegram в настройках телефона.");
     }
+  }
+
+  function closeCamera() {
+    scanning = false;
+    torchOn = false;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    camEl.classList.remove('open');
+  }
+
+  async function toggleTorch() {
+    const track = stream && stream.getVideoTracks()[0];
+    if (!track) return;
+    try {
+      torchOn = !torchOn;
+      await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+    } catch (e) {
+      camResult.textContent = "Фонарик не поддерживается на этом телефоне";
+    }
+  }
+
+  // ===== Распознавание =====
+  async function scanLoop() {
+    if (!scanning) return;
+    if (!busy && video.videoWidth) {
+      busy = true;
+      try {
+        // Вырезаем центр кадра (зона рамки): быстрее и точнее
+        const vw = video.videoWidth, vh = video.videoHeight;
+        const side = Math.floor(Math.min(vw, vh) * 0.7);
+        const sx = Math.floor((vw - side) / 2), sy = Math.floor((vh - side) / 2);
+        canvas.width = side; canvas.height = side;
+        ctx.drawImage(video, sx, sy, side, side, 0, 0, side, side);
+        const img = ctx.getImageData(0, 0, side, side);
+
+        const res = await ZXingWASM.readBarcodes(img, {
+          formats: ["DataMatrix"],
+          tryHarder: true,
+          textMode: "Plain",          // сырой код с символом GS, а не (01)(21)
+          maxNumberOfSymbols: 1
+        });
+
+        if (res.length && res[0].isValid) onDetected(res[0].text);
+      } catch (e) {
+        camResult.textContent = "Ошибка распознавания: " + e.message;
+      }
+      busy = false;
+    }
+    setTimeout(scanLoop, 100);
+  }
+
+  function onDetected(rawText) {
+    // один и тот же код в кадре не обрабатываем повторно 3 секунды
+    const now = Date.now();
+    if (rawText === lastRaw && now - lastRawTime < 3000) return;
+    lastRaw = rawText; lastRawTime = now;
+
+    frameEl.classList.add('hit');
+    setTimeout(() => frameEl.classList.remove('hit'), 400);
+    handleCode(rawText);
   }
 
   // ===== Разбор GS1 =====
@@ -87,7 +198,6 @@
 
   // ===== Отправка в таблицу =====
   async function sendScan(payload) {
-    // text/plain — чтобы браузер не делал preflight-запрос, который GAS не поддерживает
     const r = await fetch(API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -102,11 +212,13 @@
 
     if (p && scannedKeys.has(p.key)) {
       haptic('error');
+      camResult.textContent = "⚠️ Уже сканировали в этой сессии";
       addItem({ status: 'duplicate', code: p.key, msg: '⚠️ Уже сканировали в этой сессии', det: '' });
       return;
     }
     if (p) scannedKeys.add(p.key);
     haptic(p ? 'success' : 'warning');
+    camResult.textContent = "⏳ Сохраняю…";
 
     const id = addItem({ status: 'loading', code: shown, msg: '⏳ Сохраняю...', det: '' });
 
@@ -120,9 +232,11 @@
       if (res.status === 'duplicate') haptic('warning');
       if (res.status === 'error' && p) scannedKeys.delete(p.key);
       updateItem(id, res);
+      camResult.textContent = res.message + (res.details ? " · " + res.details : "");
     } catch (err) {
       if (p) scannedKeys.delete(p.key);
       updateItem(id, { status: 'error', message: '⚠️ Ошибка связи, сканируйте снова', details: String(err.message || err) });
+      camResult.textContent = "⚠️ Ошибка связи, сканируйте снова";
     }
   }
 
@@ -150,9 +264,4 @@
   }
 
   function esc(s) {
-    return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  }
-  function haptic(t) { if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred(t); }
-</script>
-</body>
-</html>
+    return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
