@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Сканер маркировки</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: sans-serif; background: #0f172a; color: #fff; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+    .header { padding: 16px; text-align: center; background: #1e293b; border-bottom: 1px solid #334155; }
+    .header h3 { margin: 0 0 14px; }
+    .scan-btn { background: #10b981; color: #fff; border: none; padding: 18px 24px; font-size: 18px; border-radius: 12px; width: 90%; font-weight: bold; }
+    .scan-btn:active { opacity: .8; }
+    #status { margin-top: 10px; font-size: 12px; opacity: .8; min-height: 16px; }
+    .scan-panel { flex: 1; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+    .scan-item { background: #1e293b; padding: 12px; border-radius: 8px; border-left: 4px solid #10b981; font-size: 14px; }
+    .scan-item.loading { border-left-color: #64748b; }
+    .scan-item.duplicate { background: #451a1a; border-left-color: #ef4444; }
+    .scan-item.error { background: #3b2a0a; border-left-color: #f59e0b; }
+    .code { font-size: 11px; opacity: .7; word-break: break-all; }
+    .msg { font-weight: bold; margin: 4px 0; }
+    .det { font-size: 12px; opacity: .9; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h3>Сканер маркировки</h3>
+    <button class="scan-btn" id="scanBtn">⚡️ Сканировать</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="scan-panel" id="itemsList"></div>
+
+<script>
+  // ===== НАСТРОЙКИ =====
+  const API_URL = "https://script.google.com/macros/s/AKfycbw_4A1fnSB62hTXU3D5hj8CgnRHbxsapwCY66RZl-5P4Kl2FDVyWIZVCPvaOh2sE6lO/exec";   // URL развёртывания GAS
+  const SERIAL_LEN = 13;
+
+  const tg = window.Telegram.WebApp;
+  tg.expand();
+  tg.ready();
+
+  const u = tg.initDataUnsafe?.user;
+  const agentName = u ? [u.first_name, u.last_name].filter(Boolean).join(' ') : "Тестовый Агент";
+
+  const statusEl = document.getElementById('status');
+  const itemsList = document.getElementById('itemsList');
+  const scannedKeys = new Set();
+  const items = [];
+  let nextId = 1;
+
+  statusEl.textContent = tg.platform + " · v" + tg.version + " · " + agentName;
+  window.addEventListener('error', e => setStatus("JS ошибка: " + e.message));
+  document.getElementById('scanBtn').addEventListener('click', startTgScanner);
+
+  function setStatus(t) { statusEl.textContent = t; }
+
+  // ===== Камера Telegram =====
+  function startTgScanner() {
+    try {
+      if (!tg.isVersionAtLeast('6.4') || typeof tg.showScanQrPopup !== 'function') {
+        setStatus("⚠️ Сканер не поддерживается (" + tg.platform + ", v" + tg.version + ")");
+        return;
+      }
+      tg.showScanQrPopup({ text: "Наведите на DataMatrix код" }, function (rawText) {
+        handleCode(rawText);
+        return true;
+      });
+    } catch (e) {
+      setStatus("❌ " + e.message);
+    }
+  }
+
+  // ===== Разбор GS1 =====
+  function parseGs1(rawText) {
+    const clean = String(rawText).replace(/^\]d2/, '').replace(/^\x1d/, '');
+    const m = clean.match(/^01(\d{14})21([\s\S]+)$/);
+    if (!m) return null;
+    const rest = m[2];
+    const gs = rest.indexOf('\x1d');
+    const serial = gs >= 0 ? rest.slice(0, gs) : rest.slice(0, SERIAL_LEN);
+    if (serial.length < 1 || serial.length > 20) return null;
+    return { gtin: m[1], serial, key: m[1] + serial };
+  }
+
+  // ===== Отправка в таблицу =====
+  async function sendScan(payload) {
+    // text/plain — чтобы браузер не делал preflight-запрос, который GAS не поддерживает
+    const r = await fetch(API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload)
+    });
+    return r.json();
+  }
+
+  async function handleCode(rawText) {
+    const p = parseGs1(rawText);
+    const shown = p ? p.key : String(rawText).slice(0, 40);
+
+    if (p && scannedKeys.has(p.key)) {
+      haptic('error');
+      addItem({ status: 'duplicate', code: p.key, msg: '⚠️ Уже сканировали в этой сессии', det: '' });
+      return;
+    }
+    if (p) scannedKeys.add(p.key);
+    haptic(p ? 'success' : 'warning');
+
+    const id = addItem({ status: 'loading', code: shown, msg: '⏳ Сохраняю...', det: '' });
+
+    try {
+      const res = await sendScan({
+        raw: rawText,
+        gtin: p ? p.gtin : "",
+        serial: p ? p.serial : "",
+        agent: agentName
+      });
+      if (res.status === 'duplicate') haptic('warning');
+      if (res.status === 'error' && p) scannedKeys.delete(p.key);
+      updateItem(id, res);
+    } catch (err) {
+      if (p) scannedKeys.delete(p.key);
+      updateItem(id, { status: 'error', message: '⚠️ Ошибка связи, сканируйте снова', details: String(err.message || err) });
+    }
+  }
+
+  // ===== Список =====
+  function addItem(item) {
+    item.id = nextId++;
+    items.unshift(item);
+    render();
+    return item.id;
+  }
+
+  function updateItem(id, res) {
+    const it = items.find(i => i.id === id);
+    if (it) { it.status = res.status; it.msg = res.message; it.det = res.details || ''; }
+    render();
+  }
+
+  function render() {
+    itemsList.innerHTML = items.map(i => `
+      <div class="scan-item ${esc(i.status)}">
+        <div class="code">${esc(i.code)}</div>
+        <div class="msg">${esc(i.msg)}</div>
+        <div class="det">${esc(i.det)}</div>
+      </div>`).join('');
+  }
+
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function haptic(t) { if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred(t); }
+</script>
+</body>
+</html>
