@@ -12,7 +12,6 @@
     .header { padding: 16px; text-align: center; background: #1e293b; border-bottom: 1px solid #334155; }
     .header h3 { margin: 0 0 14px; }
     .scan-btn { background: #10b981; color: #fff; border: none; padding: 18px 24px; font-size: 18px; border-radius: 12px; width: 90%; font-weight: bold; }
-    .test-btn { background: #334155; margin-top: 8px; font-size: 15px; padding: 12px; }
     #status { margin-top: 10px; font-size: 12px; opacity: .8; min-height: 16px; word-break: break-word; }
     .scan-panel { flex: 1; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
     .scan-item { background: #1e293b; padding: 12px; border-radius: 8px; border-left: 4px solid #10b981; font-size: 14px; }
@@ -28,11 +27,9 @@
     #video { width: 100%; height: 100%; object-fit: cover; }
     .frame { position: absolute; top: 50%; left: 50%; width: 65vmin; height: 65vmin; transform: translate(-50%, -50%);
              border: 3px solid rgba(255,255,255,.9); border-radius: 16px; box-shadow: 0 0 0 9999px rgba(0,0,0,.45); }
-    .frame.hit { border-color: #10b981; border-width: 6px; }
     .cam-top { position: absolute; top: 0; left: 0; right: 0; padding: 16px; text-align: center; font-size: 15px; }
-    #fps { font-size: 11px; opacity: .6; margin-top: 4px; }
     .cam-bottom { position: absolute; bottom: 0; left: 0; right: 0; padding: 16px; display: flex; gap: 10px; flex-direction: column; align-items: center; }
-    #camResult { min-height: 44px; width: 92%; padding: 10px; border-radius: 10px; background: rgba(15,23,42,.85); font-size: 14px; text-align: center; word-break: break-all; }
+    #camResult { min-height: 44px; width: 92%; padding: 10px; border-radius: 10px; background: rgba(15,23,42,.85); font-size: 14px; text-align: center; }
     .cam-btns { display: flex; gap: 10px; width: 92%; }
     .cam-btns button { flex: 1; padding: 14px; border: none; border-radius: 12px; font-size: 16px; font-weight: bold; color: #fff; }
     #torchBtn { background: #334155; }
@@ -44,7 +41,6 @@
   <div class="header">
     <h3>Сканер маркировки</h3>
     <button class="scan-btn" id="scanBtn">📷 Сканировать</button>
-    <button class="scan-btn test-btn" id="testBtn">🧪 Тест отправки</button>
     <div id="status"></div>
   </div>
 
@@ -52,16 +48,13 @@
 
   <div id="cam">
     <video id="video" playsinline muted></video>
-    <div class="frame" id="frame"></div>
-    <div class="cam-top">
-      Наведите Data Matrix в рамку
-      <div id="fps"></div>
-    </div>
+    <div class="frame"></div>
+    <div class="cam-top">Наведите Data Matrix в рамку</div>
     <div class="cam-bottom">
       <div id="camResult">Ищу код…</div>
       <div class="cam-btns">
         <button id="torchBtn">🔦 Фонарик</button>
-        <button id="closeBtn">✕ Готово</button>
+        <button id="closeBtn">✕ Отмена</button>
       </div>
     </div>
   </div>
@@ -69,34 +62,35 @@
 
 <script>
   // ===== НАСТРОЙКИ =====
-  const API_URL = "https://script.google.com/macros/s/AKfycbzN4Fd358uX_loSJF9Jfixkt1KPOpRN4zPWI2FlrMruO8dlVu7B9dxJQhe9ETOpb5j2/exec";
+  const API_URL = "https://script.google.com/macros/s/AKfycbwABlThnMN9DxX3kf8FQbM3bqBniEhT7SLK5sGH7TURRV50nT_RVHielxb6AlyzMBrN/exec";
   const SERIAL_LEN = 13;
 
   const tg = window.Telegram.WebApp;
   tg.expand();
   tg.ready();
 
+  // Имя агента + Telegram ID (имя может быть эмодзи, ID всегда уникален)
   const u = tg.initDataUnsafe?.user;
-  const agentName = u ? [u.first_name, u.last_name].filter(Boolean).join(' ') : "Тестовый Агент";
+  const agentName = u
+    ? ([u.first_name, u.last_name].filter(Boolean).join(' ') + (u.username ? " @" + u.username : "") + " #" + u.id)
+    : "Тестовый Агент";
 
   const $ = id => document.getElementById(id);
   const statusEl = $('status'), itemsList = $('itemsList');
-  const camEl = $('cam'), video = $('video'), frameEl = $('frame'), camResult = $('camResult'), fpsEl = $('fps');
+  const camEl = $('cam'), video = $('video'), camResult = $('camResult');
   const canvas = $('canvas'), ctx = canvas.getContext('2d', { willReadFrequently: true });
 
   const scannedKeys = new Set();
   const items = [];
   let nextId = 1;
   let stream = null, scanning = false, busy = false, torchOn = false;
-  let lastRaw = "", lastRawTime = 0, attempts = 0;
 
-  setStatus(tg.platform + " · v" + tg.version + " · " + agentName);
+  setStatus(agentName);
 
   window.addEventListener('error', e => {
     if (e.message && e.message !== 'Script error.') setStatus("JS ошибка: " + e.message);
   });
 
-  // Проверяем, что библиотека загрузилась, и заранее грузим модуль распознавания
   if (typeof ZXingWASM === 'undefined') {
     setStatus("❌ Библиотека сканера не загрузилась. Проверьте интернет.");
   } else {
@@ -106,33 +100,20 @@
   $('scanBtn').addEventListener('click', openCamera);
   $('closeBtn').addEventListener('click', closeCamera);
   $('torchBtn').addEventListener('click', toggleTorch);
-  $('testBtn').addEventListener('click', () => {
-    // Тестовый код в формате маркировки: проверяет связь с таблицей без камеры
-    const GS = String.fromCharCode(29);
-    const serial = ("T" + Date.now()).slice(-13);
-    handleCode("01" + "04780000000017" + "21" + serial + GS + "91EE10" + GS + "92testsignature");
-  });
 
   function setStatus(t) { statusEl.textContent = t; }
 
   // ===== Камера =====
   async function openCamera() {
-    if (typeof ZXingWASM === 'undefined') {
-      setStatus("❌ Библиотека сканера не загрузилась");
-      return;
-    }
+    if (typeof ZXingWASM === 'undefined') { setStatus("❌ Библиотека сканера не загрузилась"); return; }
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: "environment" },
-          width: { ideal: 1920 }, height: { ideal: 1080 }
-        },
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: false
       });
       video.srcObject = stream;
       await video.play();
 
-      // Непрерывная фокусировка, если камера поддерживает
       try {
         const track = stream.getVideoTracks()[0];
         const caps = track.getCapabilities ? track.getCapabilities() : {};
@@ -143,7 +124,6 @@
 
       camEl.classList.add('open');
       camResult.textContent = "Ищу код…";
-      attempts = 0;
       scanning = true;
       scanLoop();
     } catch (e) {
@@ -190,26 +170,18 @@
           maxNumberOfSymbols: 1
         });
 
-        attempts++;
-        fpsEl.textContent = "камера " + vw + "×" + vh + " · попыток: " + attempts;
-
-        if (res.length && res[0].isValid) onDetected(res[0].text);
+        // Код найден: сразу останавливаем сканирование и закрываем камеру
+        if (scanning && res.length && res[0].isValid) {
+          const raw = res[0].text;
+          closeCamera();
+          handleCode(raw);
+        }
       } catch (e) {
         camResult.textContent = "Ошибка распознавания: " + e.message;
       }
       busy = false;
     }
-    setTimeout(scanLoop, 100);
-  }
-
-  function onDetected(rawText) {
-    const now = Date.now();
-    if (rawText === lastRaw && now - lastRawTime < 3000) return;
-    lastRaw = rawText; lastRawTime = now;
-
-    frameEl.classList.add('hit');
-    setTimeout(() => frameEl.classList.remove('hit'), 500);
-    handleCode(rawText);
+    if (scanning) setTimeout(scanLoop, 100);
   }
 
   // ===== Разбор GS1 =====
@@ -232,11 +204,8 @@
       body: JSON.stringify(payload)
     });
     const text = await r.text();
-    try {
-      return JSON.parse(text);
-    } catch (e) {
-      throw new Error("Сервер ответил не JSON (проверьте доступ развёртывания «Все»): " + text.slice(0, 80));
-    }
+    try { return JSON.parse(text); }
+    catch (e) { throw new Error("Сервер ответил не JSON: " + text.slice(0, 80)); }
   }
 
   async function handleCode(rawText) {
@@ -245,13 +214,11 @@
 
     if (p && scannedKeys.has(p.key)) {
       haptic('error');
-      camResult.textContent = "⚠️ Уже сканировали в этой сессии";
-      addItem({ status: 'duplicate', code: p.key, msg: '⚠️ Уже сканировали в этой сессии', det: '' });
+      addItem({ status: 'duplicate', code: p.key, msg: '⚠️ Эту пачку вы уже сканировали', det: '' });
       return;
     }
     if (p) scannedKeys.add(p.key);
     haptic(p ? 'success' : 'warning');
-    camResult.textContent = "⏳ Сохраняю… " + shown;
 
     const id = addItem({ status: 'loading', code: shown, msg: '⏳ Сохраняю...', det: '' });
 
@@ -265,12 +232,9 @@
       if (res.status === 'duplicate') haptic('warning');
       if (res.status === 'error' && p) scannedKeys.delete(p.key);
       updateItem(id, res);
-      camResult.textContent = res.message + (res.details ? " · " + res.details : "");
     } catch (err) {
       if (p) scannedKeys.delete(p.key);
-      const msg = String(err.message || err);
-      updateItem(id, { status: 'error', message: '⚠️ Ошибка связи', details: msg });
-      camResult.textContent = "⚠️ Ошибка связи: " + msg;
+      updateItem(id, { status: 'error', message: '⚠️ Ошибка связи, сканируйте снова', details: String(err.message || err) });
     }
   }
 
